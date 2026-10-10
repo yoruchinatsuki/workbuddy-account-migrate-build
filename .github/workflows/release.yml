@@ -1,0 +1,180 @@
+name: Build and Release
+
+run-name: Build ${{ inputs.tag_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag, for example v1.7.1'
+        required: true
+        type: string
+      prerelease:
+        description: 'Publish this release as a prerelease'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-22.04
+          - macos-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential patchelf ccache
+
+      - name: Install Nuitka
+        run: python -m pip install --upgrade pip nuitka
+
+      - name: Compile executables with Nuitka
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for script in migrate migrate_session migrate_project; do
+            args=(--mode=onefile --assume-yes-for-downloads --output-dir=dist)
+            if [[ "$RUNNER_OS" == "Windows" ]]; then
+              args+=(--msvc=latest)
+            fi
+            python -m nuitka "${args[@]}" "scripts/${script}.py"
+          done
+
+      - name: Smoke-test compiled executables
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            suffix=".exe"
+          else
+            suffix=".bin"
+          fi
+          for script in migrate migrate_session migrate_project; do
+            executable="dist/${script}${suffix}"
+            if [[ ! -f "$executable" ]]; then
+              echo "Expected executable was not produced: $executable" >&2
+              echo "Contents of dist/:" >&2
+              ls -la dist >&2
+              exit 1
+            fi
+            "$executable" --help >/dev/null
+          done
+
+      - name: Package release ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import shutil
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          names = ("migrate", "migrate_session", "migrate_project")
+          suffix = ".exe" if sys.platform == "win32" else ".bin"
+          stage = Path("release-stage")
+          output = Path("release-assets")
+          shutil.rmtree(stage, ignore_errors=True)
+          shutil.rmtree(output, ignore_errors=True)
+          stage.mkdir(parents=True)
+          output.mkdir(parents=True)
+
+          for name in names:
+              source = Path("dist") / f"{name}{suffix}"
+              if not source.is_file():
+                  raise SystemExit(f"Missing compiled executable: {source}")
+              shutil.copy2(source, stage / source.name)
+
+          for filename in ("README.md", "LICENSE"):
+              source = Path(filename)
+              if source.is_file():
+                  shutil.copy2(source, stage / filename)
+
+          instructions = """WorkBuddy Account Migration Tools
+
+          Included commands:
+            migrate         - Migrate account sessions, memory, and connectors.
+            migrate_session - Migrate a single conversation between editions.
+            migrate_project - Export or import a project's conversations across devices.
+
+          Usage:
+            Windows: run the desired .exe from PowerShell or Command Prompt.
+            Linux/macOS: run chmod +x *.bin once, then run the desired ./<name>.bin.
+
+          Run each command with --help to see its options. Close WorkBuddy when a command
+          requires it. Back up important data before performing migrations.
+
+          These binaries are unsigned. macOS may show a Gatekeeper warning when first
+          launching a downloaded executable.
+          """
+          (stage / "RUNNING.txt").write_text(instructions, encoding="utf-8")
+
+          os_name = {
+              "Windows": "windows",
+              "Linux": "linux",
+              "macOS": "macos",
+          }.get(os.environ.get("RUNNER_OS", ""), os.environ.get("RUNNER_OS", "unknown").lower())
+          architecture = os.environ.get("RUNNER_ARCH", "unknown").lower()
+          archive = output / f"workbuddy-account-migrate-{os_name}-{architecture}.zip"
+          with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for file in sorted(stage.iterdir()):
+                  zf.write(file, arcname=file.name)
+
+          print(f"Created {archive} ({archive.stat().st_size} bytes)")
+          PY
+
+      - name: Upload packaged binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}
+          path: release-assets/*.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all platform packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish Release and upload binaries
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ inputs.tag_name }}
+          generate_release_notes: true
+          prerelease: ${{ inputs.prerelease }}
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: release-assets/*.zip
